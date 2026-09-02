@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Searchable popup of sway/i3 keybindings.
+
+Reads the live config via `swaymsg -t get_config` (or i3-msg), which keeps
+comments and resolves includes, then shows the bindings in rofi.
+
+Descriptions come from, in order of preference:
+  1. the comment line(s) immediately above a run of bindsym lines
+  2. a tidied-up version of the command itself
+
+Selecting an entry runs that binding's command.
+"""
+
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+FLAGS = {
+    "--locked", "--release", "--no-repeat", "--to-code", "--whole-window",
+    "--border", "--exclude-titlebar", "--inhibited", "--no-warn",
+}
+
+KEY_PRETTY = {
+    "mod4": "Super", "mod1": "Alt", "mod2": "Mod2", "mod3": "Mod3",
+    "mod5": "Mod5", "control": "Ctrl", "ctrl": "Ctrl", "shift": "Shift",
+    "alt": "Alt", "super": "Super", "return": "Enter", "escape": "Esc",
+    "space": "Space", "grave": "`", "minus": "-", "plus": "+",
+    "equal": "=", "bracketleft": "[", "bracketright": "]",
+    "semicolon": ";", "apostrophe": "'", "comma": ",", "period": ".",
+    "slash": "/", "backslash": "\\", "tab": "Tab", "backspace": "Backspace",
+    "delete": "Del", "prior": "PgUp", "next": "PgDn",
+}
+
+
+def get_config():
+    """Return (config_text, msg_command)."""
+    for cmd in ("swaymsg", "i3-msg"):
+        if not shutil.which(cmd):
+            continue
+        try:
+            out = subprocess.run(
+                [cmd, "-t", "get_config"], capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.returncode != 0:
+            continue
+        try:
+            return json.loads(out.stdout)["config"], cmd
+        except (ValueError, KeyError):
+            continue
+    sys.exit("keybinds: no running sway or i3 found")
+
+
+def expand(text, variables):
+    # Longest names first so $mod doesn't eat the start of $modifier.
+    for name in sorted(variables, key=len, reverse=True):
+        text = text.replace(name, variables[name])
+    return text
+
+
+def pretty_keys(keys):
+    parts = []
+    for part in keys.split("+"):
+        parts.append(KEY_PRETTY.get(part.lower(), part))
+    return "+".join(parts)
+
+
+def pretty_command(command):
+    cmd = command.strip()
+    if cmd.startswith("exec "):
+        cmd = cmd[5:].strip()
+        if cmd.startswith("--no-startup-id "):
+            cmd = cmd[16:].strip()
+    return cmd
+
+
+def parse(config):
+    variables = {}
+    bindings = []          # dicts: keys, command, desc, section, mode
+    section = ""
+    mode = ""
+    depth = 0              # brace depth of non-mode blocks (bar {}, colors {})
+    pending = []           # comment lines gathered above a run of bindings
+    run_desc = ""          # description carried across a run of bindsym lines
+    in_run = False
+
+    for raw in config.splitlines():
+        line = raw.strip()
+
+        if not line:
+            pending = []
+            in_run = False
+            continue
+
+        if line.startswith("#"):
+            text = line.lstrip("#").strip()
+            if not text:
+                continue
+            # A comment ending in ':' is a section heading, not a description.
+            if text.endswith(":"):
+                section = text[:-1].strip()
+                pending = []
+            else:
+                if in_run:
+                    pending = []
+                    in_run = False
+                pending.append(text)
+            continue
+
+        if re.match(r"^set\s+\$", line):
+            _, name, value = re.split(r"\s+", line, maxsplit=2)
+            variables[name] = value.strip()
+            continue
+
+        m = re.match(r'^mode\s+(?:--pango_markup\s+)?"?([^"{]+)"?\s*\{', line)
+        if m and not mode:
+            mode = m.group(1).strip()
+            pending = []
+            in_run = False
+            continue
+
+        if line.endswith("{") and not mode:
+            depth += 1
+            continue
+
+        if line.startswith("}"):
+            if mode:
+                mode = ""
+            elif depth:
+                depth -= 1
+            pending = []
+            in_run = False
+            continue
+
+        m = re.match(r"^bind(?:sym|code)\s+(.*)$", line)
+        if not m:
+            pending = []
+            in_run = False
+            continue
+
+        rest = m.group(1)
+
+        tokens = rest.split()
+        while tokens and tokens[0] in FLAGS:
+            tokens.pop(0)
+        if len(tokens) < 2:
+            continue
+        keys, command = tokens[0], " ".join(tokens[1:])
+
+        if not in_run:
+            run_desc = " ".join(pending)
+            in_run = True
+        desc = run_desc
+
+        keys = expand(keys, variables)
+        command = expand(command, variables)
+        bindings.append({
+            "keys": pretty_keys(keys),
+            "command": command,
+            "desc": desc or pretty_command(command),
+            "section": section,
+            "mode": mode,
+        })
+
+    return bindings
+
+
+def main():
+    config, msg = get_config()
+    bindings = parse(config)
+    if not bindings:
+        sys.exit("keybinds: no bindings found")
+
+    width = max(len(b["keys"]) for b in bindings)
+    rows = []
+    for b in bindings:
+        scope = b["mode"] and f"mode: {b['mode']}" or b["section"]
+        keys = html.escape(b["keys"].ljust(width))
+        desc = html.escape(b["desc"])
+        tail = f'  <span alpha="45%">{html.escape(scope)}</span>' if scope else ""
+        rows.append(f"<b>{keys}</b>   {desc}{tail}")
+
+    rofi = subprocess.run(
+        [
+            "rofi", "-dmenu", "-i", "-markup-rows", "-format", "i",
+            "-p", "keys", "-matching", "fuzzy",
+            "-theme-str", "window { width: 60%; } listview { lines: 20; }",
+            "-font", "monospace 11",
+        ],
+        input="\n".join(rows), capture_output=True, text=True,
+    )
+    if rofi.returncode != 0 or not rofi.stdout.strip():
+        return
+
+    index = int(rofi.stdout.strip())
+    if not 0 <= index < len(bindings):
+        return  # user typed something that matched nothing
+    chosen = bindings[index]
+    if chosen["mode"]:
+        return  # mode-local bindings only make sense inside that mode
+    subprocess.run([msg, "--", chosen["command"]],
+                   capture_output=True, text=True)
+
+
+if __name__ == "__main__":
+    main()
