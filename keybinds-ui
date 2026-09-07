@@ -189,8 +189,9 @@ def main():
         [
             "rofi", "-dmenu", "-i", "-markup-rows", "-format", "i",
             "-p", "keys", "-matching", "fuzzy",
+            # Colours, font and spacing come from ~/.config/rofi; only the
+            # list geometry is overridden, since this list is long and wide.
             "-theme-str", "window { width: 60%; } listview { lines: 20; }",
-            "-font", "monospace 11",
         ],
         input="\n".join(rows), capture_output=True, text=True,
     )
